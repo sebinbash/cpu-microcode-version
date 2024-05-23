@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+
+import glob, re, os, sys, csv, json, http.client, argparse, subprocess, pathlib
+
+microcode_re = re.compile(r"(cpu|soc)(?P<cpuid>[0-9A-F]+)_(plat(?P<platform>[0-9A-F]{2})_)?(ver|rev)(?P<microcode>[0-9A-F.]+)_(sig\[(?P<signature>\S+)\]_)?((?P<date>\d{4}-\d{2}-\d{2})_)?((?P<pr>(PRD|PRE))_)?(?P<checksum>[0-9A-F]+).bin")
+groups = ["cpuid", "platform", "microcode", "signature", "date", "pr", "checksum"]
+
+def find_microcodes(basedir):
+    microcodes = []
+    for path in glob.glob(basedir + "**/*.bin", recursive=True):
+        microcodes.append(parse_microcode(path))
+    return microcodes
+
+def get_microcodes_csv(path):
+    microcodes = []
+    with path.open("r") as file:
+        r = csv.DictReader(file)
+        for row in r:
+            microcodes.append(row)
+    return microcodes
+
+def get_microcodes_git():
+    microcodes = []
+    conn = http.client.HTTPSConnection("api.github.com")
+    conn.request("GET", "/repos/platomav/CPUMicrocodes/git/trees/master?recursive=1", headers={'User-Agent': 'python-http-client'})
+    resp = conn.getresponse()
+    body = resp.read()
+    data = json.loads(body)
+    for obj in data["tree"]:
+        if "bin" in obj["path"]:
+            microcodes.append(parse_microcode(obj["path"]))
+    return microcodes
+
+def parse_microcode(path):
+    file = os.path.basename(path)
+    microcode = {}
+    m = microcode_re.match(file)
+    if m != None:
+        for group in groups:
+            microcode[group] = m.group(group).lower() if m.group(group) != None else ""
+    return microcode
+
+def save_microcodes(microcodes, path):
+    with path.open("w", newline="") as file:
+        w = csv.DictWriter(file, fieldnames=groups)
+        w.writeheader()
+        for r in microcodes:
+            if bool(r):
+                w.writerow(r)
+    print(f"Database saved to {path}")
+
+def get_microcode_version(cpu_id=None):
+    if not cpu_id:
+        try:
+            dmidecode_cmd = subprocess.check_output(["dmidecode", "-t", "4"]).decode("utf-8")
+            cpu_id = "".join(list(filter(lambda l: "ID" in l, dmidecode_cmd.split("\n")))[0].split()[1:][3::-1]).lower()
+        except:
+            print("Could not run dmidecode, maybe try with sudo")
+            sys.exit(1)
+    cpuinfo_cmd = pathlib.Path("/proc/cpuinfo").read_text()
+    microcode_version = list(filter(lambda l: "microcode" in l, cpuinfo_cmd.split("\n")))[0].split()[2].strip()[2:].lower()
+
+    return (cpu_id, microcode_version)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(prog="cpu_microcode_version", description="Get the current CPU microcode version")
+    parser.add_argument("-c", "--csv", help="Path to the CSV database. If not present, it will be downloaded from the web.", default=pathlib.Path("microcodes.csv"), type=pathlib.Path)
+    parser.add_argument("-d", "--dont-save", help="Don't save the downloaded microcodes database", action="store_true")
+    parser.add_argument("-i", "--id", help="CPU ID. By default the CPU ID will be determined using dmidecode (requires root privileges)")
+    args = parser.parse_args()
+
+    if args.csv.exists():
+        mc = get_microcodes_csv(args.csv)
+    else:
+        mc = get_microcodes_git()
+
+    cpu_id, microcode_version = get_microcode_version(args.id)
+    print(f"CPU ID: {cpu_id}")
+    print(f"Current Microcode Version: {microcode_version}")
+    current_microcodes = list(filter(lambda x: str(x.get("cpuid")) in cpu_id, mc))
+    if len(current_microcodes) > 0:
+        print(f"Latest microcode version: {current_microcodes[0]['microcode']}")
+    else:
+        print(f"No microcode found for CPU ID: {cpu_id}")
+
+    if not args.dont_save:
+        save_microcodes(mc, args.csv)
